@@ -293,16 +293,6 @@ struct Job {
     func faultXor() -> UInt8 { UInt8((meta >> 24) & 0xFF) }
 }
 
-func loadJob(_ job: Job, _ s: UnsafeMutablePointer<UInt8>) {
-    let w = [job.w0, job.w1, job.w2, job.w3]
-    for i in 0..<4 {
-        s[i * 4] = UInt8(truncatingIfNeeded: w[i])
-        s[i * 4 + 1] = UInt8(truncatingIfNeeded: w[i] >> 8)
-        s[i * 4 + 2] = UInt8(truncatingIfNeeded: w[i] >> 16)
-        s[i * 4 + 3] = UInt8(truncatingIfNeeded: w[i] >> 24)
-    }
-}
-
 func storeBlock(_ s: UnsafePointer<UInt8>) -> [UInt8] {
     (0..<16).map { s[$0] }
 }
@@ -319,6 +309,20 @@ let RSPairs: [(Int, Int, Int, Int)] = [(0, 1, 2, 3), (0, 2, 3, 1), (0, 3, 1, 2)]
 
 func postShift(_ s: [UInt8], encryptWB: Bool) -> [UInt8] {
     encryptWB ? invShiftRow(s) : shiftRow(s)
+}
+
+func postShiftInto(_ src: UnsafePointer<UInt8>, _ dst: inout [UInt8], encryptWB: Bool) {
+    let idx = encryptWB ? AESConst.invShift : AESConst.shift
+    for i in 0..<16 { dst[i] = src[Int(idx[i])] }
+}
+
+func fillCounter(_ v: UInt64, _ block: inout [UInt8]) {
+    for i in 0..<16 { block[i] = 0 }
+    var x = v
+    for k in 0..<8 {
+        block[15 - k] = UInt8(truncatingIfNeeded: x)
+        x >>= 8
+    }
 }
 
 func attackView(_ raw: [UInt8], encryptWB: Bool, outputF: [Encoding16], reverseMC: Bool) -> [UInt8] {
@@ -402,12 +406,13 @@ final class Whitebox {
     }
 
     func applyReverseRaw(_ block: [UInt8]) throws -> [UInt8] {
-        // Opposite direction, no fault. Implemented on CPU (510 calls in step 1).
         var s = block
-        return s.withUnsafeMutableBufferPointer { buf -> [UInt8] in
-            cpuForward(buf.baseAddress!, faultRound: nil, faultByte: 0, faultXor: 0, encrypt: !isEncrypt)
-            return Array(buf)
+        s.withUnsafeMutableBufferPointer { buf in
+            withTabs { rk, enc, dec, rp, rv in
+                aese_forward(rk, enc, dec, rp, rv, Int32(nr), isEncrypt ? 0 : 1, buf.baseAddress!, -1, 0, 0)
+            }
         }
+        return s
     }
 
     func applyFaultRaw(_ block: [UInt8], round: Int, byte: Int, xor: UInt8) throws -> [UInt8] {
@@ -428,9 +433,10 @@ final class Whitebox {
         if let engine, !forceCPU {
             try engine.eval(jobs, n, out, encrypt: isEncrypt)
         } else {
-            for i in 0..<n {
-                loadJob(jobs[i], out + i * 16)
-                cpuForward(out + i * 16, faultRound: jobs[i].faultRound(), faultByte: jobs[i].faultByte(), faultXor: jobs[i].faultXor(), encrypt: isEncrypt)
+            precondition(MemoryLayout<Job>.stride == 20)
+            if n == 0 { return }
+            withTabs { rk, enc, dec, rp, rv in
+                aese_eval_jobs(rk, enc, dec, rp, rv, Int32(nr), isEncrypt ? 1 : 0, UnsafeRawPointer(jobs), Int32(n), out)
             }
         }
     }
@@ -447,22 +453,12 @@ final class Whitebox {
                 }
             }
         } else {
-            out.withUnsafeMutableBufferPointer { op in
-                plains.withUnsafeBufferPointer { pp in
-                    for b in 0..<16 {
-                        for xi in 0..<256 {
-                            let src = (b * 256 + xi) * 16
-                            for fval in 0..<256 {
-                                let dst = ((b * 256 + xi) * 256 + fval) * 16
-                                for i in 0..<16 { op[dst + i] = pp[src + i] }
-                                let fr: Int? = fval == 0 ? nil : faultRound
-                                let fx: UInt8 = fval == 0 ? 0 : UInt8(fval)
-                                cpuForward(op.baseAddress! + dst, faultRound: fr, faultByte: faultBytes[b], faultXor: fx, encrypt: isEncrypt)
-                                // attack view
-                                var tmp = Array(UnsafeBufferPointer(start: op.baseAddress! + dst, count: 16))
-                                tmp = postShift(tmp, encryptWB: isEncrypt)
-                                for i in 0..<16 { op[dst + i] = tmp[i] }
-                            }
+            plains.withUnsafeBufferPointer { pp in
+                faultBytes.withUnsafeBufferPointer { fb in
+                    out.withUnsafeMutableBufferPointer { op in
+                        withTabs { rk, enc, dec, rp, rv in
+                            aese_step2(rk, enc, dec, rp, rv, Int32(nr), isEncrypt ? 1 : 0,
+                                       pp.baseAddress!, fb.baseAddress!, Int32(faultRound), op.baseAddress!)
                         }
                     }
                 }
@@ -515,118 +511,37 @@ final class Whitebox {
         return (flags, inputs)
     }
 
-    private func cpuForward(_ s: UnsafeMutablePointer<UInt8>, faultRound: Int?, faultByte: UInt8, faultXor: UInt8, encrypt: Bool) {
-        if encrypt {
-            applyTab(s, decTab, 0)
-            for r in 0..<nr {
-                if faultRound == r { inject(s, attackRound: r, fbyte: faultByte, fxor: faultXor, encrypt: true) }
-                encRound(s, r)
+    private func withTabs(_ body: (UnsafePointer<UInt8>, UnsafePointer<UInt8>, UnsafePointer<UInt8>, UnsafePointer<UInt8>, UnsafePointer<UInt8>) -> Void) {
+        roundKeys.withUnsafeBufferPointer { rk in
+            encTab.withUnsafeBufferPointer { enc in
+                decTab.withUnsafeBufferPointer { dec in
+                    roundPerm.withUnsafeBufferPointer { rp in
+                        revPerm.withUnsafeBufferPointer { rv in
+                            body(rk.baseAddress!, enc.baseAddress!, dec.baseAddress!, rp.baseAddress!, rv.baseAddress!)
+                        }
+                    }
+                }
             }
-            applyTab(s, encTab, nr)
-        } else {
-            applyTab(s, decTab, nr)
-            for ar in 0..<nr {
-                let aesR = nr - 1 - ar
-                if faultRound == ar { inject(s, attackRound: ar, fbyte: faultByte, fxor: faultXor, encrypt: false) }
-                decRound(s, aesR)
-            }
-            applyTab(s, encTab, 0)
-        }
-    }
-
-    private func applyTab(_ s: UnsafeMutablePointer<UInt8>, _ tab: [UInt8], _ round: Int) {
-        tab.withUnsafeBufferPointer { tp in
-            let base = tp.baseAddress!
-            for i in 0..<16 {
-                s[i] = base[(round * 16 + i) * 256 + Int(s[i])]
-            }
-        }
-    }
-
-    private func inject(_ s: UnsafeMutablePointer<UInt8>, attackRound: Int, fbyte: UInt8, fxor: UInt8, encrypt: Bool) {
-        if encrypt {
-            applyTab(s, encTab, attackRound)
-            var pos = Int(fbyte)
-            if attackRound != 0 { pos = Int(roundPerm[(attackRound - 1) * 16 + Int(fbyte)]) }
-            s[pos] ^= fxor
-            applyTab(s, decTab, attackRound)
-        } else {
-            let aesRound = nr - 1 - attackRound
-            let encRound = aesRound + 1
-            applyTab(s, encTab, encRound)
-            var pos = Int(fbyte)
-            if encRound != nr { pos = Int(revPerm[aesRound * 16 + Int(fbyte)]) }
-            s[pos] ^= fxor
-            applyTab(s, decTab, encRound)
-        }
-    }
-
-    private func addRK(_ s: UnsafeMutablePointer<UInt8>, _ round: Int) {
-        let off = round * 16
-        for i in 0..<16 { s[i] ^= roundKeys[off + i] }
-    }
-
-    private func encRound(_ s: UnsafeMutablePointer<UInt8>, _ round: Int) {
-        addRK(s, round)
-        if round == nr - 1 {
-            var t = [UInt8](repeating: 0, count: 16)
-            for i in 0..<16 { t[i] = AESConst.sbox[Int(s[Int(AESConst.shift[i])])] }
-            for i in 0..<16 { s[i] = t[i] }
-            addRK(s, nr)
-        } else {
-            var t = [UInt8](repeating: 0, count: 16)
-            for i in 0..<16 { t[i] = AESConst.sbox[Int(s[Int(AESConst.shift[i])])] }
-            for c in 0..<4 {
-                let i = c * 4
-                let a = t[i], b = t[i + 1], d = t[i + 2], e = t[i + 3]
-                s[i] = AESConst.mul2[Int(a)] ^ AESConst.mul3[Int(b)] ^ d ^ e
-                s[i + 1] = a ^ AESConst.mul2[Int(b)] ^ AESConst.mul3[Int(d)] ^ e
-                s[i + 2] = a ^ b ^ AESConst.mul2[Int(d)] ^ AESConst.mul3[Int(e)]
-                s[i + 3] = AESConst.mul3[Int(a)] ^ b ^ d ^ AESConst.mul2[Int(e)]
-            }
-        }
-    }
-
-    private func decRound(_ s: UnsafeMutablePointer<UInt8>, _ round: Int) {
-        if round == nr - 1 {
-            addRK(s, nr)
-            var t = [UInt8](repeating: 0, count: 16)
-            for i in 0..<16 { t[i] = s[Int(AESConst.invShift[i])] }
-            for i in 0..<16 { s[i] = AESConst.invSbox[Int(t[i])] }
-            addRK(s, round)
-        } else {
-            var t = [UInt8](repeating: 0, count: 16)
-            for c in 0..<4 {
-                let i = c * 4
-                let a = s[i], b = s[i + 1], d = s[i + 2], e = s[i + 3]
-                t[i] = AESConst.mul14[Int(a)] ^ AESConst.mul11[Int(b)] ^ AESConst.mul13[Int(d)] ^ AESConst.mul9[Int(e)]
-                t[i + 1] = AESConst.mul9[Int(a)] ^ AESConst.mul14[Int(b)] ^ AESConst.mul11[Int(d)] ^ AESConst.mul13[Int(e)]
-                t[i + 2] = AESConst.mul13[Int(a)] ^ AESConst.mul9[Int(b)] ^ AESConst.mul14[Int(d)] ^ AESConst.mul11[Int(e)]
-                t[i + 3] = AESConst.mul11[Int(a)] ^ AESConst.mul13[Int(b)] ^ AESConst.mul9[Int(d)] ^ AESConst.mul14[Int(e)]
-            }
-            var u = [UInt8](repeating: 0, count: 16)
-            for i in 0..<16 { u[i] = t[Int(AESConst.invShift[i])] }
-            for i in 0..<16 { s[i] = AESConst.invSbox[Int(u[i])] }
-            addRK(s, round)
         }
     }
 
     private func cpuStep1(base: UInt64, count: Int, valueRef: [UInt8], doubleRS: Bool, flags: inout [UInt32], inputs: inout [UInt8]) {
-        var block = [UInt8](repeating: 0, count: 16)
-        for i in 0..<count {
-            let v = base + UInt64(i)
-            for k in 0..<16 { block[k] = 0 }
-            var x = v
-            for k in 0..<8 {
-                block[15 - k] = UInt8(truncatingIfNeeded: x)
-                x >>= 8
+        if count == 0 { return }
+        var raw = [UInt8](repeating: 0, count: count * 16)
+        raw.withUnsafeMutableBufferPointer { rp in
+            withTabs { rk, enc, dec, _, _ in
+                aese_counters(rk, enc, dec, Int32(nr), isEncrypt ? 1 : 0, base, Int32(count), rp.baseAddress!)
             }
-            let saved = block
-            block.withUnsafeMutableBufferPointer { buf in
-                cpuForward(buf.baseAddress!, faultRound: nil, faultByte: 0, faultXor: 0, encrypt: isEncrypt)
+        }
+        var view = [UInt8](repeating: 0, count: 16)
+        var input = [UInt8](repeating: 0, count: 16)
+        raw.withUnsafeBufferPointer { rp in
+            let p = rp.baseAddress!
+            for i in 0..<count {
+                postShiftInto(p + i * 16, &view, encryptWB: isEncrypt)
+                fillCounter(base + UInt64(i), &input)
+                considerStep1(&view, input: input, valueRef: valueRef, doubleRS: doubleRS, flags: &flags, inputs: &inputs)
             }
-            var view = postShift(block, encryptWB: isEncrypt)
-            considerStep1(&view, input: saved, valueRef: valueRef, doubleRS: doubleRS, flags: &flags, inputs: &inputs)
         }
     }
 }

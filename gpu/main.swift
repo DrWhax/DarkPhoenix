@@ -146,7 +146,12 @@ func nist() throws {
 func checkOracle(_ wb: Whitebox) throws {
     var rng = SplitMix64(state: 99)
     let saved = wb.forceCPU
-    for round in 0..<min(wb.nr, 4) {
+    var rounds = Array(0..<min(wb.nr, 4))
+    if wb.nr > 4 {
+        rounds.append(wb.nr - 2)
+        rounds.append(wb.nr - 1)
+    }
+    for round in rounds {
         let pt = rng.bytes(16)
         let byte = rng.below(16)
         let x = UInt8(1 + rng.below(255))
@@ -173,12 +178,40 @@ func checkOracle(_ wb: Whitebox) throws {
     wb.forceCPU = saved
 }
 
+func checkStep2(_ wb: Whitebox) throws {
+    var plains = [UInt8](repeating: 0, count: 16 * 256 * 16)
+    for i in 0..<plains.count { plains[i] = UInt8(truncatingIfNeeded: i &* 17 &+ 9) }
+    let fb = (0..<16).map { UInt8($0) }
+    let saved = wb.forceCPU
+    defer { wb.forceCPU = saved }
+    for round in [0, wb.nr - 2, wb.nr - 1] {
+        wb.forceCPU = true
+        let cpu = try wb.step2(plains, faultRound: round, faultBytes: fb)
+        wb.forceCPU = false
+        let gpu = try wb.step2(plains, faultRound: round, faultBytes: fb)
+        if cpu.count != gpu.count {
+            throw AttackError.fail("AESE step2 length mismatch at fault round \(round)")
+        }
+        let mismatch = cpu.withUnsafeBytes { c in
+            gpu.withUnsafeBytes { g in
+                memcmp(c.baseAddress, g.baseAddress, c.count)
+            }
+        }
+        if mismatch != 0 {
+            var at = 0
+            for i in 0..<cpu.count where cpu[i] != gpu[i] { at = i; break }
+            let block = at / 16
+            throw AttackError.fail("AESE step2 mismatch round \(round) block \(block) fval \(block % 256) byte \(at % 16)")
+        }
+    }
+}
+
 func runOne(key: [UInt8], seed: UInt64, encrypt: Bool, reverse: Bool, doubleRS: Bool, identity: Bool, cpu: Bool, encodings: Bool, config: AttackConfig = AttackConfig()) throws -> Recovery {
     let wb = try Whitebox(key: key, encrypt: encrypt, seed: seed == 0 ? 1 : seed, identity: identity, forceCPU: cpu)
     if !cpu, let name = wb.engine?.deviceName {
         print("GPU  \(name)")
     } else {
-        print("CPU  fallback")
+        print("CPU  AESE")
     }
     if !cpu { try checkOracle(wb) }
     var rng = SplitMix64(state: seed == 0 ? 1 : seed)
@@ -225,6 +258,12 @@ func selftest() throws {
     try selfTestLinearAlgebra()
     try nist()
     print("algebra and NIST AES ok")
+    let probeKey = Array(0..<16).map { UInt8($0) }
+    let probe = try Whitebox(key: probeKey, encrypt: true, seed: 7, identity: false, forceCPU: false)
+    try checkStep2(probe)
+    let probeD = try Whitebox(key: probeKey, encrypt: false, seed: 7, identity: false, forceCPU: false)
+    try checkStep2(probeD)
+    print("AESE step2 matches GPU")
     let cases: [(String, [UInt8], Bool, Bool, Bool, Bool)] = [
         ("AES-128 enc reverse identity", Array(0..<16).map { UInt8($0) }, true, true, true, false),
         ("AES-128 enc reverse random", Array(0..<16).map { UInt8($0) }, true, true, false, false),
@@ -273,9 +312,10 @@ func bench(_ n: Int) throws {
     let ng = min(n, 1 << 20)
     let gs = try time(g, ng)
     print(String(format: "GPU  %d faulted AES-128   %.3f s   %.2f M/s   %@", ng, gs, Double(ng) / gs / 1e6, (g.engine?.deviceName ?? "") as NSString))
-    let nc = min(n, 1 << 16)
+    let nc = ng
+    _ = try time(c, min(nc, 1 << 12))
     let cs = try time(c, nc)
-    print(String(format: "CPU  %d faulted AES-128   %.3f s   %.2f M/s", nc, cs, Double(nc) / cs / 1e6))
+    print(String(format: "CPU  %d faulted AES-128   %.3f s   %.2f M/s   AESE", nc, cs, Double(nc) / cs / 1e6))
 }
 
 setvbuf(stdout, nil, _IONBF, 0)
