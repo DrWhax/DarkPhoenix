@@ -113,3 +113,15 @@ Faulted AES-128 throughput (`--bench`):
 - CPython + `cryptography`: 0.029 M blocks/s
 
 Step 2 alone is 1,048,576 faulted encryptions. That is about 36 s in the Python tool and about 6–12 ms here. The Python tool also needs Sage for step 3; this port does not.
+
+```
+ ┌────────────────────┬─────────────────┬──────────────┬────────────────────────────────────────────────┐
+ │ Path               │ Faulted AES-128 │ Step 2 alone │ Full key recovery                              │
+ ├────────────────────┼─────────────────┼──────────────┼────────────────────────────────────────────────┤
+ │ Metal GPU          │ 74.3 M/s        │ ~14 ms       │ 124 ms (0.16 s wall, including shader compile) │
+ ├────────────────────┼─────────────────┼──────────────┼────────────────────────────────────────────────┤
+ │ Swift CPU          │ 1.88 M/s        │ ~0.56 s      │ 697 ms                                         │
+ ├────────────────────┼─────────────────┼──────────────┼────────────────────────────────────────────────┤
+ │ Python DarkPhoenix │ 0.0297 M/s      │ ~35 s        │ about 40 s plus Sage, which is not installed   │
+ └────────────────────┴─────────────────┴──────────────┴────────────────────────────────────────────────┘
+```
