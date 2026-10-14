@@ -22,6 +22,14 @@ $ pip install darkphoenixAES
 $ python3 -m darkphoenixAES --selftest
 ```
 
+## Metal port
+
+[`gpu/`](gpu/README.md) is a Swift/Metal port. Pass `--oracle` to attack an external `WhiteBoxedAES` (see `gpu/oracle.py`), or run the encoded AES white-box on the GPU. Sage is not required. An in-process AES-128 recovery on an M5 Pro is about 110 ms.
+
+```bash
+$ cd gpu && make && ./darkphoenix-metal --selftest
+```
+
 ## Usage
 
 To use this attack, you should
