@@ -80,14 +80,14 @@ Do not write to stdout from the oracle; the protocol owns it. Prints are redirec
 ./darkphoenix-metal --bench 1048576
 ```
 
-`--cpu` runs the same attack on the Swift CPU white-box, which is what the GPU results are checked against.
+`--cpu` runs the same attack with an ARM AES/NEON C kernel called from Swift. It uses the CPU's AES instructions for the rounds and table lookups for the byte encodings. GPU results are checked against this CPU implementation.
 
 ## What runs where
 
 | Work | Where |
 | --- | --- |
-| Faulted / plain encoded AES (steps 1–5) | Metal compute kernels |
-| Step 1 search when the white-box has no inverse | Metal, atomic slot fill |
+| Faulted / plain encoded AES (steps 1–5) | Metal compute kernels, or ARM AES/NEON with `--cpu` |
+| Step 1 search when the white-box has no inverse | Metal, atomic slot fill; CPU search with `--cpu` |
 | Tolhuizen, meet-in-the-middle, key schedule | Swift |
 | Step 3.2 matrix identification (was Sage) | Swift GF(2) linear algebra |
 
@@ -95,33 +95,38 @@ A white-box that is an external process (debugger, remote oracle) is still limit
 
 ## Measured on this machine
 
-Apple M5 Pro, 16 GPU cores, macOS 27. Full key recovery includes external-encoding verification.
+Apple M5 Pro, 16 GPU cores, macOS 27.0.1. Rerun on 2026-10-15 with the optimized `make` build. Values are medians of seven runs after one discarded warm-up per case, with CPU and GPU recovery runs interleaved.
 
-| Case | Time |
-| --- | --- |
-| AES-128 encrypt, random encodings, inverse available | ~110 ms |
-| AES-128 encrypt, no inverse (GPU step 1) | ~120 ms |
-| AES-128 decrypt, random encodings | ~100 ms |
-| AES-256 encrypt, random encodings | ~125 ms |
-| Same AES-128 attack, Swift CPU | ~680 ms |
-| Python `WhiteBoxedAESTest` faulted encrypt | 0.029 M/s |
+Full key recovery with random encodings (`--seed 7 --encodings`), including external-encoding recovery and verification:
 
-Faulted AES-128 throughput (`--bench`):
+| Case | Metal | CPU ARM AES/NEON |
+| --- | ---: | ---: |
+| AES-128 encrypt, inverse available | 121.1 ms | 66.4 ms |
+| AES-128 encrypt, no inverse (step 1 search) | 119.7 ms | 100.8 ms |
+| AES-128 decrypt, inverse available | 103.8 ms | 49.4 ms |
+| AES-256 encrypt, inverse available | 129.1 ms | 67.9 ms |
 
-- Metal: **81 M blocks/s**
-- Swift CPU: 1.9 M blocks/s
-- CPython + `cryptography`: 0.029 M blocks/s
+These are the program's `total` timings, which exclude process startup, white-box initialization, and Metal setup/oracle checks. For AES-128 encrypt with an inverse, median process wall time was 165.5 ms on Metal and 72.3 ms on CPU. The accelerated CPU is about **1.8× faster** for this full recovery.
 
-Step 2 alone is 1,048,576 faulted encryptions. That is about 36 s in the Python tool and about 6–12 ms here. The Python tool also needs Sage for step 3; this port does not.
+Faulted AES-128 throughput (`--bench 1048576`, identity encodings, batches of 65,536):
 
+| Backend | Throughput |
+| --- | ---: |
+| Metal | 75.50 M blocks/s |
+| CPU ARM AES/NEON | 54.39 M blocks/s |
+
+`--bench` reports both backends and includes Swift job construction and dispatch overhead. It uses identity encodings regardless of other flags. Metal is about **1.4× faster** in this benchmark.
+
+Step 2 uses a specialized batch path, so its time should not be inferred from `--bench`. For the AES-128 encrypt recovery with an inverse and random encodings, measured step 2 time was **9.4 ms on Metal** and **7.8 ms on CPU** for 1,048,576 faulted outputs, including result processing. The CPU kernel reuses the prefix before the fault across XOR values.
+
+To repeat the recovery cases, run each command with and without `--cpu`:
+
+```bash
+./darkphoenix-metal --seed 7 --encodings
+./darkphoenix-metal --seed 7 --encodings --no-reverse
+./darkphoenix-metal --seed 7 --encodings --decrypt
+./darkphoenix-metal --seed 7 --encodings --bits 256
+./darkphoenix-metal --bench 1048576
 ```
- ┌────────────────────┬─────────────────┬──────────────┬────────────────────────────────────────────────┐
- │ Path               │ Faulted AES-128 │ Step 2 alone │ Full key recovery                              │
- ├────────────────────┼─────────────────┼──────────────┼────────────────────────────────────────────────┤
- │ Metal GPU          │ 74.3 M/s        │ ~14 ms       │ 124 ms (0.16 s wall, including shader compile) │
- ├────────────────────┼─────────────────┼──────────────┼────────────────────────────────────────────────┤
- │ Swift CPU          │ 1.88 M/s        │ ~0.56 s      │ 697 ms                                         │
- ├────────────────────┼─────────────────┼──────────────┼────────────────────────────────────────────────┤
- │ Python DarkPhoenix │ 0.0297 M/s      │ ~35 s        │ about 40 s plus Sage, which is not installed   │
- └────────────────────┴─────────────────┴──────────────┴────────────────────────────────────────────────┘
-```
+
+The earlier CPython + `cryptography` `WhiteBoxedAESTest` measurement was 0.029 M faulted blocks/s (about 36 s for 1,048,576 calls). This historical baseline was not rerun: the available Python environments lack `tqdm`. The Python tool also needs Sage for step 3; this port does not.
